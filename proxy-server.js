@@ -1,12 +1,18 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Allowed origins (browser requests)
+// Cache directory
+const CACHE_DIR = path.join(__dirname, 'cache');
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+// Allowed origins
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['http://localhost:5173', 'http://localhost:3000'];
@@ -24,7 +30,10 @@ app.use(cors({
 
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
-// Stream / Subtitles / Images Proxy
+// Helper to get cache file path
+const getCachePath = (url) => path.join(CACHE_DIR, encodeURIComponent(url));
+
+// Stream / Subtitles / Images Proxy with segment caching
 app.get('/stream', async (req, res) => {
   const targetUrl = req.query.url;
   const referer = req.query.referer;
@@ -35,24 +44,36 @@ app.get('/stream', async (req, res) => {
   try { urlObj = new URL(String(targetUrl)); } 
   catch (e) { return res.status(400).json({ error: 'Invalid URL', message: e.message }); }
 
-  // Force HTTPS on the target URL
   if (urlObj.protocol === 'http:') urlObj.protocol = 'https:';
 
   try {
-    const headers = { 
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': '*/*'
-    };
+    const headers = { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' };
     if (referer) headers['Referer'] = referer;
+
+    const cacheFile = getCachePath(urlObj.toString());
+
+    // Serve from cache if exists
+    if (fs.existsSync(cacheFile)) {
+      const cached = fs.readFileSync(cacheFile);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=60'); // cached
+      const contentType = path.extname(urlObj.pathname).includes('.m3u8')
+        ? 'application/vnd.apple.mpegurl'
+        : urlObj.pathname.endsWith('.vtt')
+          ? 'text/vtt'
+          : 'application/octet-stream';
+      res.setHeader('Content-Type', contentType);
+      return res.send(cached);
+    }
 
     const upstream = await fetch(urlObj.toString(), { headers });
     if (!upstream.ok) return res.status(upstream.status).send(await upstream.text());
 
     const contentType = upstream.headers.get('content-type') || '';
-    res.setHeader('Access-Control-Allow-Origin', '*'); // CORS
-    res.setHeader('Cache-Control', 'public, max-age=30'); // Cache for 30s
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=60');
 
-    // HLS Playlist (.m3u8)
+    // HLS Playlist
     if (contentType.includes('application/vnd.apple.mpegurl') || urlObj.pathname.endsWith('.m3u8')) {
       const text = await upstream.text();
       const origin = `${req.protocol}://${req.get('host')}`;
@@ -64,35 +85,25 @@ app.get('/stream', async (req, res) => {
         try {
           const segmentUrl = new URL(l, urlObj);
           if (segmentUrl.protocol === 'http:') segmentUrl.protocol = 'https:';
-
           const sp = new URLSearchParams({ url: segmentUrl.toString() });
           if (referer) sp.set('referer', referer);
-
           return `${origin}/stream?${sp.toString()}`;
         } catch { return line; }
       }).join('\n');
 
+      // Cache playlist
+      fs.writeFileSync(cacheFile, rewritten, 'utf8');
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(rewritten);
     }
 
-    // Subtitles (.vtt)
-    if (urlObj.pathname.endsWith('.vtt')) {
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.setHeader('Content-Type', 'text/vtt');
-      return res.send(buf);
-    }
-
-    // Images (.jpg, .png, .webp)
-    if (/\.(jpg|jpeg|png|webp|gif)$/i.test(urlObj.pathname)) {
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      res.setHeader('Content-Type', contentType || 'application/octet-stream');
-      return res.send(buf);
-    }
-
-    // Other content: passthrough
+    // Subtitles / Images / Other content
     const buf = Buffer.from(await upstream.arrayBuffer());
-    res.setHeader('Content-Type', contentType || 'application/octet-stream');
+    fs.writeFileSync(cacheFile, buf);
+    if (urlObj.pathname.endsWith('.vtt')) res.setHeader('Content-Type', 'text/vtt');
+    else if (/\.(jpg|jpeg|png|webp|gif)$/i.test(urlObj.pathname)) res.setHeader('Content-Type', contentType || 'image/*');
+    else res.setHeader('Content-Type', contentType || 'application/octet-stream');
+
     return res.send(buf);
 
   } catch (err) {
