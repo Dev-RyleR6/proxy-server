@@ -12,14 +12,21 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['http://localhost:5173', 'http://localhost:3000'];
 
-// ✅ Dynamic CORS setup
+// ✅ Print allowed origins on startup
+console.log('✅ Allowed Origins:', allowedOrigins);
+
+// ✅ Dynamic CORS setup with clear logging
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true); // Allow non-browser requests
+    if (!origin) {
+      console.log('🌐 Non-browser request allowed');
+      return callback(null, true);
+    }
     if (allowedOrigins.includes(origin)) {
+      console.log(`✅ CORS allowed: ${origin}`);
       return callback(null, true);
     } else {
-      console.warn(`❌ CORS Blocked: ${origin}`);
+      console.warn(`🚫 CORS blocked: ${origin}`);
       return callback(new Error('Not allowed by CORS'));
     }
   },
