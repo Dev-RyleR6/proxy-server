@@ -43,60 +43,88 @@ app.get('/stream', async (req, res) => {
   if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   let urlObj;
-  try { urlObj = new URL(targetUrl); } 
-  catch (e) { return res.status(400).json({ error: 'Invalid URL', message: e.message }); }
+  try {
+    urlObj = new URL(String(targetUrl));
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid URL', message: String(e?.message || e) });
+  }
 
   try {
     const headers = {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': '*/*'
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Connection': 'keep-alive',
     };
-    if (referer) headers['Referer'] = referer;
+    if (referer) headers['Referer'] = String(referer);
 
     const upstream = await fetch(urlObj.toString(), { headers });
-    if (!upstream.ok) return res.status(upstream.status).send(await upstream.text());
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '');
+      console.error(`❌ Upstream fetch failed [${upstream.status}] for ${targetUrl}`);
+      return res.status(upstream.status).send(text || 'Upstream error');
+    }
+
+    // ✅ CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Referer, User-Agent');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
 
     const contentType = upstream.headers.get('content-type') || '';
+    res.setHeader('Content-Type', contentType || 'application/octet-stream');
 
-    // HLS Playlist
-    if (contentType.includes('application/vnd.apple.mpegurl') || urlObj.pathname.endsWith('.m3u8')) {
+    // ✅ Handle HLS playlists
+    if (
+      contentType.includes('application/vnd.apple.mpegurl') ||
+      contentType.includes('application/x-mpegURL') ||
+      urlObj.pathname.endsWith('.m3u8')
+    ) {
       const text = await upstream.text();
       const origin = `${req.protocol}://${req.get('host')}`;
-      const rewritten = text.split('\n').map(line => {
+      const base = urlObj;
+
+      const rewritten = text.split('\n').map((line) => {
         const l = line.trim();
         if (!l || l.startsWith('#')) return line;
         try {
-          const segmentUrl = new URL(l, urlObj).toString();
-          const sp = new URLSearchParams({ url: segmentUrl });
-          if (referer) sp.set('referer', referer);
+          const resolved = new URL(l, base).toString();
+          const sp = new URLSearchParams({ url: resolved });
+          if (referer) sp.set('referer', String(referer));
           return `${origin}/stream?${sp.toString()}`;
-        } catch { return line; }
+        } catch {
+          return line;
+        }
       }).join('\n');
 
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-      res.setHeader('Access-Control-Allow-Origin', '*');
       return res.send(rewritten);
     }
 
-    // Subtitles (.vtt)
-    if (urlObj.pathname.endsWith('.vtt')) {
+    // ✅ Stream binary or image data safely
+    if (upstream.body && typeof upstream.body.pipe === 'function') {
+      console.log(`📡 Streaming ${urlObj.pathname} (${contentType})`);
+      upstream.body.pipe(res);
+      upstream.body.on('error', (err) => {
+        console.error('❌ Stream error:', err.message);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Stream pipe error', message: err.message });
+        } else {
+          res.destroy(err);
+        }
+      });
+    } else {
+      console.log(`📦 Buffering ${urlObj.pathname} (${contentType})`);
       const buf = Buffer.from(await upstream.arrayBuffer());
-      res.setHeader('Content-Type', 'text/vtt');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      return res.send(buf);
+      res.send(buf);
     }
-
-    // Other content (images, etc.)
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.setHeader('Content-Type', contentType || 'application/octet-stream');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    return res.send(buf);
-
   } catch (err) {
-    console.error('Proxy error:', err);
-    return res.status(500).json({ error: 'Proxy error', message: err.message });
+    console.error('❌ Stream proxy error:', err);
+    return res.status(500).json({ error: 'Stream proxy error', message: String(err?.message || err) });
   }
 });
+
 
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
