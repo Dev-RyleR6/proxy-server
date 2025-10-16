@@ -1,15 +1,18 @@
 const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Allowed origins (browser requests)
+// ✅ Load allowed origins from .env
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['http://localhost:5173', 'http://localhost:3000'];
+  : ['http://localhost:5173', 'https://localhost:5173'];
 
+<<<<<<< HEAD
 console.log('✅ Allowed Origins:', allowedOrigins);
 
 // Dynamic CORS setup
@@ -19,6 +22,15 @@ app.use(cors({
       console.log('🌐 Non-browser request allowed');
       return callback(null, true);
     }
+=======
+// ✅ Log allowed origins
+console.log('✅ Allowed Origins:', allowedOrigins);
+
+// ✅ Dynamic CORS setup
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // Allow curl/postman
+>>>>>>> parent of fda5475 (fix: Server only handles playlists + subtitles → minimal load.)
     if (allowedOrigins.includes(origin)) {
       console.log(`✅ CORS allowed: ${origin}`);
       return callback(null, true);
@@ -31,12 +43,37 @@ app.use(cors({
 }));
 
 app.use(express.json());
+<<<<<<< HEAD
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'OK' }));
 
 // Stream + Subtitles Proxy
 
+=======
+
+// ✅ Force HTTPS redirect when deployed on Railway
+app.enable('trust proxy');
+app.use((req, res, next) => {
+  if (req.headers['x-forwarded-proto'] !== 'https' && process.env.NODE_ENV === 'production') {
+    return res.redirect(301, 'https://' + req.headers.host + req.url);
+  }
+  next();
+});
+
+// ✅ Health check route
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', message: 'Proxy server is running' });
+});
+
+// ✅ Optional passthrough proxy
+app.use('/proxy', createProxyMiddleware({
+  target: 'https://example.com',
+  changeOrigin: true,
+}));
+
+// ✅ Main HLS / stream proxy
+>>>>>>> parent of fda5475 (fix: Server only handles playlists + subtitles → minimal load.)
 app.get('/stream', async (req, res) => {
   const targetUrl = req.query.url;
   const referer = req.query.referer;
@@ -127,8 +164,16 @@ app.get('/stream', async (req, res) => {
 });
 
 
+<<<<<<< HEAD
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
   console.log(`📺 Stream proxy: http://localhost:${PORT}/stream?url=<URL>&referer=<REFERER>`);
   console.log(`🔧 Health check: http://localhost:${PORT}/health`);
+=======
+// ✅ Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Proxy server running on port ${PORT}`);
+  console.log(`📺 Stream proxy: https://your-railway-app.up.railway.app/stream?url=<URL>&referer=<REFERER>`);
+  console.log(`🔧 Health check: https://your-railway-app.up.railway.app/health`);
+>>>>>>> parent of fda5475 (fix: Server only handles playlists + subtitles → minimal load.)
 });
