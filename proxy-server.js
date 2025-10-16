@@ -78,31 +78,29 @@ app.get('/stream', async (req, res) => {
     const upstream = await fetch(urlObj.toString(), { headers });
 
     if (!upstream.ok) {
-      return res.status(upstream.status).send(await upstream.text());
+      const text = await upstream.text().catch(() => '');
+      return res.status(upstream.status).send(text || 'Upstream error');
     }
 
-    // ✅ Always respond with secure headers
+    // ✅ Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Referer, User-Agent');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
 
     const contentType = upstream.headers.get('content-type') || '';
-    const isPlaylist = contentType.includes('application/vnd.apple.mpegurl')
-      || contentType.includes('application/x-mpegURL')
-      || urlObj.pathname.endsWith('.m3u8');
 
-    // ✅ Handle M3U8 rewriting securely
-    if (isPlaylist) {
-      let text = await upstream.text();
-
-      // Convert all HTTP → HTTPS (very important)
-      text = text.replace(/http:\/\//g, 'https://');
-
-      // Rewrite relative URLs into absolute proxied HTTPS URLs
-      const origin = `https://${req.get('host')}`;
+    // ✅ If it’s an HLS playlist (.m3u8), rewrite URLs
+    if (
+      contentType.includes('application/vnd.apple.mpegurl') ||
+      contentType.includes('application/x-mpegURL') ||
+      urlObj.pathname.endsWith('.m3u8')
+    ) {
+      const text = await upstream.text();
+      const origin = `${req.protocol}://${req.get('host')}`;
       const base = urlObj;
-      const rewritten = text.split('\n').map(line => {
+
+      const rewritten = text.split('\n').map((line) => {
         const l = line.trim();
         if (!l || l.startsWith('#')) return line;
         try {
@@ -119,16 +117,20 @@ app.get('/stream', async (req, res) => {
       return res.send(rewritten);
     }
 
-    // ✅ For segments / binary data
+    // ✅ Otherwise, stream binary data (images, .ts, etc.)
     res.setHeader('Content-Type', contentType || 'application/octet-stream');
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    return res.send(buf);
-
+    if (upstream.body && upstream.body.pipe) {
+      upstream.body.pipe(res);
+    } else {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.send(buf);
+    }
   } catch (err) {
-    console.error('❌ Stream proxy error:', err);
+    console.error('Stream proxy error:', err);
     return res.status(500).json({ error: 'Stream proxy error', message: String(err?.message || err) });
   }
 });
+
 
 // ✅ Start server
 app.listen(PORT, () => {
