@@ -72,50 +72,71 @@ app.get('/stream', async (req, res) => {
     if (referer) headers['Referer'] = String(referer);
 
     const upstream = await fetch(urlObj.toString(), { headers });
+
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
       console.error(`❌ Upstream fetch failed [${upstream.status}] for ${targetUrl}`);
       return res.status(upstream.status).send(text || 'Upstream error');
     }
 
-    // Set safe CORS headers for the response
+    // ✅ CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Referer, User-Agent');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
 
     const contentType = upstream.headers.get('content-type') || '';
-    const isPlaylist = contentType.includes('application/vnd.apple.mpegurl')
-      || contentType.includes('application/x-mpegURL')
-      || urlObj.pathname.endsWith('.m3u8');
+    res.setHeader('Content-Type', contentType || 'application/octet-stream');
 
-    if (isPlaylist) {
+    // ✅ Handle HLS playlists
+    if (
+      contentType.includes('application/vnd.apple.mpegurl') ||
+      contentType.includes('application/x-mpegURL') ||
+      urlObj.pathname.endsWith('.m3u8')
+    ) {
       const text = await upstream.text();
       const origin = `${req.protocol}://${req.get('host')}`;
       const base = urlObj;
+
       const rewritten = text.split('\n').map((line) => {
         const l = line.trim();
         if (!l || l.startsWith('#')) return line;
-        let resolved;
-        try { resolved = new URL(l, base).toString(); } catch { return line; }
-        const sp = new URLSearchParams({ url: resolved });
-        if (referer) sp.set('referer', String(referer));
-        return `${origin}/stream?${sp.toString()}`;
+        try {
+          const resolved = new URL(l, base).toString();
+          const sp = new URLSearchParams({ url: resolved });
+          if (referer) sp.set('referer', String(referer));
+          return `${origin}/stream?${sp.toString()}`;
+        } catch {
+          return line;
+        }
       }).join('\n');
 
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(rewritten);
     }
 
-    res.setHeader('Content-Type', contentType || 'application/octet-stream');
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    return res.send(buf);
+    // ✅ Stream binary or image data safely
+    if (upstream.body && typeof upstream.body.pipe === 'function') {
+      console.log(`📡 Streaming ${urlObj.pathname} (${contentType})`);
+      upstream.body.pipe(res);
+      upstream.body.on('error', (err) => {
+        console.error('❌ Stream error:', err.message);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Stream pipe error', message: err.message });
+        } else {
+          res.destroy(err);
+        }
+      });
+    } else {
+      console.log(`📦 Buffering ${urlObj.pathname} (${contentType})`);
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.send(buf);
+    }
   } catch (err) {
-    console.error('Stream proxy error:', err);
+    console.error('❌ Stream proxy error:', err);
     return res.status(500).json({ error: 'Stream proxy error', message: String(err?.message || err) });
   }
 });
-
 
 
 
