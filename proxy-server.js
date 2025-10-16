@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -15,17 +17,9 @@ console.log('✅ Allowed Origins:', allowedOrigins);
 // Dynamic CORS setup
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin) {
-      console.log('🌐 Non-browser request allowed');
-      return callback(null, true);
-    }
-    if (allowedOrigins.includes(origin)) {
-      console.log(`✅ CORS allowed: ${origin}`);
-      return callback(null, true);
-    } else {
-      console.warn(`🚫 CORS blocked: ${origin}`);
-      return callback(new Error('Not allowed by CORS'));
-    }
+    if (!origin) return callback(null, true); // non-browser requests
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
 }));
@@ -61,7 +55,7 @@ app.get('/stream', async (req, res) => {
     // HLS Playlist
     if (contentType.includes('application/vnd.apple.mpegurl') || urlObj.pathname.endsWith('.m3u8')) {
       const text = await upstream.text();
-      const origin = `${req.protocol}://${req.get('host')}`;
+      const origin = `https://${req.get('host')}`;
       const rewritten = text.split('\n').map(line => {
         const l = line.trim();
         if (!l || l.startsWith('#')) return line;
@@ -98,8 +92,14 @@ app.get('/stream', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Proxy server running on port ${PORT}`);
-  console.log(`📺 Stream proxy: http://localhost:${PORT}/stream?url=<URL>&referer=<REFERER>`);
-  console.log(`🔧 Health check: http://localhost:${PORT}/health`);
+// ✅ HTTPS local server
+const sslOptions = {
+  key: fs.readFileSync('./certs/key.pem'),   // generate with openssl
+  cert: fs.readFileSync('./certs/cert.pem'),
+};
+
+https.createServer(sslOptions, app).listen(PORT, () => {
+  console.log(`🚀 HTTPS Proxy server running at https://localhost:${PORT}`);
+  console.log(`📺 Stream proxy: https://localhost:${PORT}/stream?url=<URL>&referer=<REFERER>`);
+  console.log(`🔧 Health check: https://localhost:${PORT}/health`);
 });
