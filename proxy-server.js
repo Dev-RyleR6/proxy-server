@@ -48,7 +48,6 @@ app.use('/proxy', createProxyMiddleware({
 }));
 
 // ✅ Main HLS / stream proxy
->>>>>>> parent of fda5475 (fix: Server only handles playlists + subtitles → minimal load.)
 app.get('/stream', async (req, res) => {
   const targetUrl = req.query.url;
   const referer = req.query.referer;
