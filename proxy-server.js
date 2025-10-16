@@ -56,11 +56,17 @@ app.get('/stream', async (req, res) => {
 
   try {
     const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36',
-      'Accept': '*/*',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': referer || 'https://megacloud.blog/',
+      'Origin': 'https://megacloud.blog',
       'Connection': 'keep-alive',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'cross-site'
     };
+
     if (referer) headers['Referer'] = String(referer);
 
     const upstream = await fetch(urlObj.toString(), { headers });
