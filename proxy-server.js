@@ -62,20 +62,18 @@ app.get('/stream', async (req, res) => {
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
-      console.error(`❌ Upstream fetch failed [${upstream.status}] for ${targetUrl}`);
       return res.status(upstream.status).send(text || 'Upstream error');
     }
 
-    // ✅ CORS headers
+    // ✅ Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Referer, User-Agent');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
 
     const contentType = upstream.headers.get('content-type') || '';
-    res.setHeader('Content-Type', contentType || 'application/octet-stream');
 
-    // ✅ Handle HLS playlists
+    // ✅ If it’s an HLS playlist (.m3u8), rewrite URLs
     if (
       contentType.includes('application/vnd.apple.mpegurl') ||
       contentType.includes('application/x-mpegURL') ||
@@ -102,25 +100,16 @@ app.get('/stream', async (req, res) => {
       return res.send(rewritten);
     }
 
-    // ✅ Stream binary or image data safely
-    if (upstream.body && typeof upstream.body.pipe === 'function') {
-      console.log(`📡 Streaming ${urlObj.pathname} (${contentType})`);
+    // ✅ Otherwise, stream binary data (images, .ts, etc.)
+    res.setHeader('Content-Type', contentType || 'application/octet-stream');
+    if (upstream.body && upstream.body.pipe) {
       upstream.body.pipe(res);
-      upstream.body.on('error', (err) => {
-        console.error('❌ Stream error:', err.message);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Stream pipe error', message: err.message });
-        } else {
-          res.destroy(err);
-        }
-      });
     } else {
-      console.log(`📦 Buffering ${urlObj.pathname} (${contentType})`);
       const buf = Buffer.from(await upstream.arrayBuffer());
       res.send(buf);
     }
   } catch (err) {
-    console.error('❌ Stream proxy error:', err);
+    console.error('Stream proxy error:', err);
     return res.status(500).json({ error: 'Stream proxy error', message: String(err?.message || err) });
   }
 });
