@@ -116,17 +116,9 @@ app.get('/stream', async (req, res) => {
 });
 
 
-<<<<<<< HEAD
+
 app.listen(PORT, () => {
-<<<<<<< HEAD
-  console.log(`🚀 Proxy server running on port ${PORT}`);
-  console.log(`📺 Stream proxy: http://localhost:${PORT}/stream?url=<URL>&referer=<REFERER>`);
-  console.log(`🔧 Health check: http://localhost:${PORT}/health`);
-=======
-// ✅ Start server
-app.listen(PORT, () => {
-=======
->>>>>>> parent of 2d036b8 (fix: rewrite http to https)
+
   console.log(`🚀 Proxy server running on http://localhost:${PORT}`);
   console.log(`📺 Stream proxy available at: http://localhost:${PORT}/stream?url=<STREAM_URL>&referer=<REFERER_URL>`);
   console.log(`🔧 Health check: http://localhost:${PORT}/health`);
