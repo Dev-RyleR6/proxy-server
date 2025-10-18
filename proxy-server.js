@@ -55,7 +55,9 @@ app.use(cors({
 
 // Force HTTPS in production
 app.use((req, res, next) => {
-  if (process.env.NODE_ENV === 'production' && !req.secure && req.headers['x-forwarded-proto'] !== 'https') {
+  // Check if we're behind a proxy (like Railway)
+  if (req.headers['x-forwarded-proto'] === 'http') {
+    // Special handling for Railway's environment
     const httpsUrl = `https://${req.headers.host}${req.url}`;
     console.log(`🔒 Redirecting to HTTPS: ${httpsUrl}`);
     return res.redirect(301, httpsUrl);
