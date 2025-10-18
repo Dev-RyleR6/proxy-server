@@ -1,6 +1,8 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
+const https = require('https');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -9,10 +11,28 @@ const PORT = process.env.PORT || 3001;
 // Load allowed origins from .env (comma-separated)
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['http://localhost:5173', 'http://localhost:3000', 'https://localhost:5173']; // Added https for Vite
+  : [
+      'http://localhost:5173',
+      'https://localhost:5173',
+      'http://localhost:3000',
+      'https://localhost:3000',
+      process.env.PRODUCTION_URL,
+      process.env.PRODUCTION_HTTPS_URL
+    ].filter(Boolean); // filter out undefined values
 
 // Print allowed origins on startup
 console.log('✅ Allowed Origins:', allowedOrigins);
+
+// Add security headers
+app.use((req, res, next) => {
+  // Enable HSTS with a 1 year max-age
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  // Prevent browsers from incorrectly detecting non-scripts as scripts
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Block site from being framed with X-Frame-Options
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
 
 // Dynamic CORS setup with clear logging
 app.use(cors({
@@ -32,6 +52,16 @@ app.use(cors({
   },
   credentials: true,
 }));
+
+// Force HTTPS in production
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production' && !req.secure && req.headers['x-forwarded-proto'] !== 'https') {
+    const httpsUrl = `https://${req.headers.host}${req.url}`;
+    console.log(`🔒 Redirecting to HTTPS: ${httpsUrl}`);
+    return res.redirect(301, httpsUrl);
+  }
+  next();
+});
 
 // Middleware
 app.use(express.json());
