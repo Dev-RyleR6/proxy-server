@@ -119,7 +119,6 @@ app.get('/stream', async (req, res) => {
     const isHlsPlaylist = contentType.includes('application/vnd.apple.mpegurl') ||
                         contentType.includes('application/x-mpegURL') ||
                         urlObj.pathname.endsWith('.m3u8');
-
     if (isHlsPlaylist) {
       const text = await upstream.text();
       // Use the request's protocol and host to build the rewrite origin
@@ -158,6 +157,8 @@ app.get('/stream', async (req, res) => {
       });
     } else {
       console.log(`📦 Buffering ${urlObj.pathname} (${contentType})`);
+      console.log('Prod: ', PRODUCTION_HTTPS_URL);
+      console.log('Production URL: ', process.env.PRODUCTION_URL);
       const buf = Buffer.from(await upstream.arrayBuffer());
       res.send(buf);
     }
