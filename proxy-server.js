@@ -15,9 +15,6 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
   : ["http://localhost:5173"];
 
-console.log("✅ Allowed Origins:", allowedOrigins);
-
-// ✅ CORS Middleware
 app.use(
   cors({
     origin(origin, callback) {
@@ -48,7 +45,6 @@ app.get("/stream", async (req, res) => {
     const { url, referer } = req.query;
     if (!url) return res.status(400).json({ error: "Missing URL parameter" });
 
-    console.log("🎯 Fetching:", url);
 
     const urlObj = new URL(url);
     const upstream = await fetch(urlObj, {
@@ -63,7 +59,6 @@ app.get("/stream", async (req, res) => {
 
     const contentType = upstream.headers.get("content-type") || "";
     const rewriteOrigin = forceHttpsOrigin(req);
-    console.log("🔁 Rewriting origin:", rewriteOrigin);
 
     // 🧩 Handle HLS (.m3u8) playlist rewriting
     const isHlsPlaylist =
