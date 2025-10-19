@@ -98,6 +98,11 @@ app.get("/stream", async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', message: 'Proxy server is running' });
+});
+
+
 app.get("/", (_, res) => {
   res.send("✅ Proxy server running with forced HTTPS rewrites!");
 });

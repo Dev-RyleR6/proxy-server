@@ -1,6 +1,7 @@
 {
   "name": "myanime-proxy-server",
   "version": "1.0.0",
+  "type": "module",
   "description": "Proxy server for MyAnime streaming with CORS and Referer header support",
   "main": "proxy-server.js",
   "scripts": {
@@ -13,6 +14,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "http-proxy-middleware": "^2.0.6",
+    "morgan": "^1.10.1",
     "node-fetch": "^3.3.2"
   },
   "devDependencies": {
