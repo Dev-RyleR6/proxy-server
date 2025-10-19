@@ -3,22 +3,33 @@ import fetch from "node-fetch";
 import cors from "cors";
 import compression from "compression";
 import morgan from "morgan";
+import dotenv from "dotenv";
+
+dotenv.config(); // ✅ Load .env first
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ Allow your frontend origins (edit if needed)
-const allowedOrigins = [
-  "https://myanime-w5in.vercel.app",
-  "http://localhost:5173"
-];
+// ✅ Parse ALLOWED_ORIGINS from .env
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+  : ["http://localhost:5173"];
 
+console.log("✅ Allowed Origins:", allowedOrigins);
+
+// ✅ CORS Middleware
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".vercel.app") ||
+        origin.endsWith(".railway.app")
+      ) {
         callback(null, true);
       } else {
+        console.warn("❌ Blocked by CORS:", origin);
         callback(new Error("Not allowed by CORS"));
       }
     },
@@ -28,7 +39,7 @@ app.use(
 app.use(compression());
 app.use(morgan("dev"));
 
-// 🧠 Helper: force HTTPS in rewrites
+// 🧠 Helper: Always rewrite to HTTPS origin
 const forceHttpsOrigin = (req) => `https://${req.get("host")}`;
 
 // 🛰️ Main Proxy Endpoint
@@ -44,7 +55,7 @@ app.get("/stream", async (req, res) => {
       headers: referer ? { referer } : {},
     });
 
-    // Copy status & headers
+    // Copy status and headers
     res.status(upstream.status);
     for (const [key, value] of upstream.headers.entries()) {
       res.setHeader(key, value);
@@ -52,7 +63,7 @@ app.get("/stream", async (req, res) => {
 
     const contentType = upstream.headers.get("content-type") || "";
     const rewriteOrigin = forceHttpsOrigin(req);
-    console.log("🔁 Rewriting using HTTPS origin:", rewriteOrigin);
+    console.log("🔁 Rewriting origin:", rewriteOrigin);
 
     // 🧩 Handle HLS (.m3u8) playlist rewriting
     const isHlsPlaylist =
@@ -76,7 +87,7 @@ app.get("/stream", async (req, res) => {
             if (referer) sp.set("referer", String(referer));
 
             const rewrittenUrl = `${rewriteOrigin}/stream?${sp.toString()}`;
-            console.log("🔗 Rewritten segment:", rewrittenUrl); // 👁 debug line
+            console.log("🔗 Rewritten segment:", rewrittenUrl);
             return rewrittenUrl;
           } catch {
             return line;
@@ -88,7 +99,7 @@ app.get("/stream", async (req, res) => {
       return res.send(rewritten);
     }
 
-    // 🧱 For non-HLS files (.ts, .mp4, etc.)
+    // 🧱 Non-HLS (binary) response
     const buffer = await upstream.arrayBuffer();
     res.send(Buffer.from(buffer));
 
@@ -98,13 +109,14 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Proxy server is running' });
+// 🩺 Health Check
+app.get("/health", (req, res) => {
+  res.json({ status: "OK", message: "Proxy server is running" });
 });
 
-
+// 🏠 Root
 app.get("/", (_, res) => {
-  res.send("✅ Proxy server running with forced HTTPS rewrites!");
+  res.send("✅ Proxy server running with .env + HTTPS rewrite!");
 });
 
 app.listen(PORT, () => {
