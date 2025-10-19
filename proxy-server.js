@@ -17,21 +17,17 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
 
 console.log("✅ Allowed Origins:", allowedOrigins);
 
-// ✅ Dynamic CORS with safety checks
+// ✅ Dynamic CORS setup
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        console.warn("🚫 CORS blocked:", origin);
-        callback(new Error("Not allowed by CORS"));
-      }
+      if (!origin || allowedOrigins.includes(origin)) callback(null, true);
+      else callback(new Error("Not allowed by CORS"));
     },
   })
 );
 
-// ✅ Compression only for text responses (avoid .ts/.mp4 decoding issues)
+// ✅ Compression only for text responses
 app.use(
   compression({
     filter: (req, res) => {
@@ -41,13 +37,12 @@ app.use(
   })
 );
 
-// ✅ Minimal logging
 app.use(morgan("tiny"));
 
-// 🧠 Helper: ensure HTTPS origin for rewrites
+// 🧠 Helper for HTTPS rewrite
 const forceHttpsOrigin = (req) => `https://${req.get("host")}`;
 
-// 🛰️ Main stream proxy endpoint
+// 🛰️ Stream proxy
 app.get("/stream", async (req, res) => {
   try {
     const { url, referer } = req.query;
@@ -60,15 +55,17 @@ app.get("/stream", async (req, res) => {
       headers: referer ? { Referer: referer } : {},
     });
 
+    // Copy headers (except problematic ones)
     res.status(upstream.status);
     for (const [key, value] of upstream.headers.entries()) {
+      if (key.toLowerCase() === "content-encoding") continue; // 🚫 Prevent decoding errors
       res.setHeader(key, value);
     }
 
     const contentType = upstream.headers.get("content-type") || "";
     const rewriteOrigin = forceHttpsOrigin(req);
 
-    // 🧩 HLS playlist rewriting (.m3u8)
+    // 🧩 Handle HLS playlist rewriting (.m3u8)
     const isHlsPlaylist =
       contentType.includes("application/vnd.apple.mpegurl") ||
       contentType.includes("application/x-mpegURL") ||
@@ -101,6 +98,7 @@ app.get("/stream", async (req, res) => {
 
     // 🧱 For binary/video data (.ts, .mp4, etc.)
     const buffer = await upstream.arrayBuffer();
+    res.setHeader("Content-Encoding", "identity"); // 🚫 Tell browser: no compression
     res.send(Buffer.from(buffer));
   } catch (err) {
     console.error("❌ Proxy Error:", err);
@@ -109,13 +107,13 @@ app.get("/stream", async (req, res) => {
 });
 
 // ✅ Health check route
-app.get("/health", (req, res) => {
+app.get("/health", (_, res) => {
   res.json({ status: "OK", message: "Proxy server is running" });
 });
 
-// ✅ Root route
+// ✅ Root
 app.get("/", (_, res) => {
-  res.send("✅ Proxy server running with HTTPS rewrites & safe compression!");
+  res.send("✅ Proxy server running with HTTPS rewrites and safe decoding!");
 });
 
 // 🚀 Start
