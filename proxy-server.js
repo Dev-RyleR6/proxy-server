@@ -5,53 +5,61 @@ import compression from "compression";
 import morgan from "morgan";
 import dotenv from "dotenv";
 
-dotenv.config(); // ✅ Load .env first
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ Parse ALLOWED_ORIGINS from .env
+// ✅ Load allowed origins from .env
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
-  : ["http://localhost:5173"];
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : [];
 
+console.log("✅ Allowed Origins:", allowedOrigins);
+
+// ✅ Dynamic CORS with safety checks
 app.use(
   cors({
     origin(origin, callback) {
-      if (
-        !origin ||
-        allowedOrigins.includes(origin) ||
-        origin.endsWith(".vercel.app") ||
-        origin.endsWith(".railway.app")
-      ) {
+      if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
-        console.warn("❌ Blocked by CORS:", origin);
+        console.warn("🚫 CORS blocked:", origin);
         callback(new Error("Not allowed by CORS"));
       }
     },
   })
 );
 
-app.use(compression());
-app.use(morgan("dev"));
+// ✅ Compression only for text responses (avoid .ts/.mp4 decoding issues)
+app.use(
+  compression({
+    filter: (req, res) => {
+      const type = res.getHeader("Content-Type") || "";
+      return /json|text|javascript|css|html/.test(type);
+    },
+  })
+);
 
-// 🧠 Helper: Always rewrite to HTTPS origin
+// ✅ Minimal logging
+app.use(morgan("tiny"));
+
+// 🧠 Helper: ensure HTTPS origin for rewrites
 const forceHttpsOrigin = (req) => `https://${req.get("host")}`;
 
-// 🛰️ Main Proxy Endpoint
+// 🛰️ Main stream proxy endpoint
 app.get("/stream", async (req, res) => {
   try {
     const { url, referer } = req.query;
     if (!url) return res.status(400).json({ error: "Missing URL parameter" });
 
+    const targetUrl = new URL(url);
+    console.log("🎯 Fetching:", targetUrl.href);
 
-    const urlObj = new URL(url);
-    const upstream = await fetch(urlObj, {
-      headers: referer ? { referer } : {},
+    const upstream = await fetch(targetUrl, {
+      headers: referer ? { Referer: referer } : {},
     });
 
-    // Copy status and headers
     res.status(upstream.status);
     for (const [key, value] of upstream.headers.entries()) {
       res.setHeader(key, value);
@@ -60,30 +68,27 @@ app.get("/stream", async (req, res) => {
     const contentType = upstream.headers.get("content-type") || "";
     const rewriteOrigin = forceHttpsOrigin(req);
 
-    // 🧩 Handle HLS (.m3u8) playlist rewriting
+    // 🧩 HLS playlist rewriting (.m3u8)
     const isHlsPlaylist =
       contentType.includes("application/vnd.apple.mpegurl") ||
       contentType.includes("application/x-mpegURL") ||
-      urlObj.pathname.endsWith(".m3u8");
+      targetUrl.pathname.endsWith(".m3u8");
 
     if (isHlsPlaylist) {
       const text = await upstream.text();
-      const base = urlObj;
+      const base = targetUrl;
 
       const rewritten = text
         .split("\n")
         .map((line) => {
           const l = line.trim();
-          if (!l || l.startsWith("#")) return line; // Keep comments
+          if (!l || l.startsWith("#")) return line;
 
           try {
             const resolved = new URL(l, base).toString();
             const sp = new URLSearchParams({ url: resolved });
             if (referer) sp.set("referer", String(referer));
-
-            const rewrittenUrl = `${rewriteOrigin}/stream?${sp.toString()}`;
-            console.log("🔗 Rewritten segment:", rewrittenUrl);
-            return rewrittenUrl;
+            return `${rewriteOrigin}/stream?${sp.toString()}`;
           } catch {
             return line;
           }
@@ -94,26 +99,26 @@ app.get("/stream", async (req, res) => {
       return res.send(rewritten);
     }
 
-    // 🧱 Non-HLS (binary) response
+    // 🧱 For binary/video data (.ts, .mp4, etc.)
     const buffer = await upstream.arrayBuffer();
     res.send(Buffer.from(buffer));
-
   } catch (err) {
     console.error("❌ Proxy Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 🩺 Health Check
+// ✅ Health check route
 app.get("/health", (req, res) => {
   res.json({ status: "OK", message: "Proxy server is running" });
 });
 
-// 🏠 Root
+// ✅ Root route
 app.get("/", (_, res) => {
-  res.send("✅ Proxy server running with .env + HTTPS rewrite!");
+  res.send("✅ Proxy server running with HTTPS rewrites & safe compression!");
 });
 
+// 🚀 Start
 app.listen(PORT, () => {
   console.log(`🚀 Proxy running on port ${PORT}`);
 });
