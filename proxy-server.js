@@ -120,7 +120,15 @@ const app = express();
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return cb(null, true);
+    
+    // If no origins specified, allow all
+    if (allowedOrigins.length === 0) return cb(null, true);
+    
+    // Check if origin is allowed
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    
     if (DEBUG) console.warn("CORS blocked:", origin);
     cb(new Error("Not allowed by CORS"));
   },
@@ -131,6 +139,15 @@ app.use(compression({ filter: (req, res) => /json|text|javascript|css|html/.test
 app.use(DEBUG ? morgan("dev") : morgan("tiny"));
 
 app.get("/health", (_, res) => res.json({ status: "OK", message: "Proxy running" }));
+
+// OPTIONS handler for CORS preflight
+app.options("/stream", (_, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.sendStatus(204);
+});
+
 const getRewriteOrigin = (req) => `https://${req.get("host")}`;
 
 // Prefetch next N segments
@@ -166,6 +183,9 @@ app.get("/stream", async (req, res) => {
       res.setHeader("X-Cache", "HIT");
       res.setHeader("Content-Encoding", "identity");
       res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL/1000)}, immutable`);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "*");
       return res.send(cached);
     }
 
@@ -175,6 +195,11 @@ app.get("/stream", async (req, res) => {
     for (const [k,v] of upstream.headers.entries()) {
       if (!["content-encoding","transfer-encoding","connection"].includes(k.toLowerCase())) res.setHeader(k,v);
     }
+
+    // Ensure CORS headers are set
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
 
     const urlPath = new URL(key).pathname;
     const rewriteOrigin = getRewriteOrigin(req);
@@ -188,6 +213,7 @@ app.get("/stream", async (req, res) => {
         if (!trimmed || trimmed.startsWith("#")) return line;
         try {
           const resolved = new URL(trimmed, base).toString();
+          if (DEBUG) console.debug("Rewriting URL:", resolved);
           const sp = new URLSearchParams({ url: resolved });
           if (referer) sp.set("referer", referer);
           return `${rewriteOrigin}/stream?${sp.toString()}`;
@@ -202,13 +228,20 @@ app.get("/stream", async (req, res) => {
       res.send(rewritten);
 
       // Prefetch segments in background
-      const segmentUrls = Array.from(new Set(lines.filter(l => !l.startsWith("#")).map(l => new URL(l, base).toString())));
+      const segmentUrls = Array.from(new Set(lines.filter(l => !l.startsWith("#")).map(l => {
+        try {
+          return new URL(l.trim(), base).toString();
+        } catch {
+          return null;
+        }
+      }).filter(Boolean)));
       if (PREFETCH_COUNT > 0) prefetchUrls(segmentUrls.slice(0,PREFETCH_COUNT), referer).catch(()=>{});
       return;
     }
 
-    // Binary/video streaming
+    // Binary/video streaming (including images)
     if (isBinaryType(contentType, urlPath)) {
+      if (DEBUG) console.debug("Serving binary content:", urlPath, "Type:", contentType);
       res.setHeader("Content-Encoding", "identity");
       res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL/1000)}, immutable`);
       res.setHeader("X-Cache", "MISS");
