@@ -1,19 +1,22 @@
 {
   "name": "myanime-proxy-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "Proxy server for MyAnime streaming with CORS and Referer header support",
+  "description": "Optimized Proxy server for MyAnime streaming with CORS, Referer header support, and caching",
   "main": "proxy-server.js",
   "scripts": {
     "start": "node proxy-server.js",
     "dev": "nodemon proxy-server.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
-    "http-proxy-middleware": "^2.0.6",
+    "lru-cache": "^10.2.1",
     "morgan": "^1.10.1",
     "node-fetch": "^3.3.2"
   },
@@ -25,7 +28,9 @@
     "cors",
     "hls",
     "streaming",
-    "anime"
+    "anime",
+    "cache",
+    "optimization"
   ],
   "author": "MyAnime Team",
   "license": "MIT"
