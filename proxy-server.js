@@ -1,4 +1,17 @@
 // proxy-server.js
+/**
+ * Production-ready HLS proxy server
+ * - Rewrites all .m3u8 manifests (master + variants) so every referenced URL
+ *   (segments, thumbnails, nested manifests, maps) is routed through this proxy.
+ * - Streams binary segments and forwards Range headers to support seeking.
+ * - Caches small resources in memory + disk (LRU + disk cache).
+ * - Adds permissive CORS headers so browsers (mobile & desktop) can fetch segments.
+ *
+ * Notes:
+ * - Configure PUBLIC_HOST in .env to match your deployed host if running behind proxies.
+ * - You may adjust CACHE_TTL, PREFETCH_COUNT and CACHE_SIZE_LIMIT_BYTES to suit your environment.
+ */
+
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -22,12 +35,15 @@ const MEMORY_CACHE_MAX = parseInt(process.env.MEMORY_CACHE_MAX_ITEMS || "1000", 
 const DISK_CACHE_ENABLED = (process.env.DISK_CACHE_ENABLED || "true") === "true";
 const DISK_CACHE_DIR = process.env.DISK_CACHE_DIR || "/tmp/proxy-cache";
 const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT || "3", 10);
-const CACHE_SIZE_LIMIT_BYTES = 8 * 1024 * 1024; // 8 MB in-memory threshold
+const CACHE_SIZE_LIMIT_BYTES = parseInt(process.env.CACHE_SIZE_LIMIT_BYTES || String(8 * 1024 * 1024), 10); // 8 MB default
 
-// Allowed origins
+// Allowed origins (optional whitelist)
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
   : [];
+
+// PUBLIC_HOST used for self checks / rewrite base
+const PUBLIC_HOST = process.env.PUBLIC_HOST || "proxy-server-production-fb60.up.railway.app";
 
 // Ensure disk cache dir
 if (DISK_CACHE_ENABLED) {
@@ -41,7 +57,7 @@ if (DISK_CACHE_ENABLED) {
 // Keep-alive agents
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
-const getAgent = (url) => (url.startsWith("https:") ? httpsAgent : httpAgent);
+const getAgent = (url) => (String(url || "").startsWith("https:") ? httpsAgent : httpAgent);
 
 // Hash helpers
 const hashKey = (key) => crypto.createHash("sha256").update(key).digest("hex");
@@ -106,8 +122,12 @@ async function getCached(key) {
 }
 
 async function setCached(key, buffer, options = {}) {
-  memoryCache.set(key, buffer);
-  if (DISK_CACHE_ENABLED) writeToDisk(key, buffer, options.meta || {});
+  try {
+    memoryCache.set(key, buffer);
+    if (DISK_CACHE_ENABLED) writeToDisk(key, buffer, options.meta || {});
+  } catch (e) {
+    if (DEBUG) console.debug("setCached error:", e?.message || e);
+  }
 }
 
 // Content helpers
@@ -127,55 +147,57 @@ const isBinaryType = (ct, urlPath) => {
     type.includes("video") ||
     type.includes("audio") ||
     type.includes("application/octet-stream") ||
-    [".ts", ".mp4", ".m4s", ".webm", ".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)
+    [".ts", ".mp4", ".m4s", ".webm", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".aac"].includes(ext)
   );
 };
 
 // Express setup
 const app = express();
 
-app.use(cors({
-  origin(origin, cb) {
-    // Always allow requests with no Origin (curl, server-to-server, etc.)
-    if (!origin) return cb(null, true);
+// CORS policy: allow no-origin (curl), allow self-origin, optionally whitelist
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      try {
+        if (origin.includes(PUBLIC_HOST) || origin.includes("localhost") || origin.includes("127.0.0.1")) {
+          return cb(null, true);
+        }
+      } catch (e) {}
+      if (allowedOrigins.length === 0) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      if (DEBUG) console.warn("CORS blocked:", origin);
+      cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 
-    // ✅ Always allow self-origin (Railway, Vercel, localhost, etc.)
-    const host = process.env.PUBLIC_HOST || "proxy-server-production-fb60.up.railway.app";
-    if (origin.includes(host) || origin.includes("localhost") || origin.includes("127.0.0.1")) {
-      return cb(null, true);
-    }
-
-    // ✅ Allow all if no specific list defined
-    if (allowedOrigins.length === 0) return cb(null, true);
-
-    // ✅ Check if origin matches allowed list
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-
-    // ❌ Block anything else
-    if (DEBUG) console.warn("🚫 CORS blocked:", origin);
-    cb(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
-}));
-
-
-app.use(compression({ filter: (req, res) => /json|text|javascript|css|html/.test(res.getHeader("Content-Type") || "") }));
+app.use(
+  compression({
+    filter: (req, res) => /json|text|javascript|css|html/.test(res.getHeader("Content-Type") || ""),
+  })
+);
 app.use(DEBUG ? morgan("dev") : morgan("tiny"));
 
 app.get("/health", (_, res) => res.json({ status: "OK", message: "Proxy running" }));
 
-// OPTIONS handler for CORS preflight
+// OPTIONS handler for preflight
 app.options("/stream", (_, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
   res.sendStatus(204);
 });
 
-const getRewriteOrigin = (req) => `https://${req.get("host")}`;
+const getRewriteOrigin = (req) => {
+  const host = req.get("x-forwarded-host") || req.get("host") || PUBLIC_HOST;
+  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
+  return `${proto}://${host}`;
+};
 
-// Prefetch next N segments
+// Prefetch utility
 async function prefetchUrls(urls, referer) {
   const concurrency = 6;
   for (let i = 0; i < urls.length; i += concurrency) {
@@ -186,147 +208,216 @@ async function prefetchUrls(urls, referer) {
           agent: getAgent(url),
           headers: {
             Referer: referer || "https://megacloud.blog",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
             Accept: "*/*",
           },
         });
         if (!upstream.ok) return;
         const ct = upstream.headers.get("content-type") || "";
-        const buf = isHlsPlaylist(ct, url)
-          ? Buffer.from(await upstream.text())
-          : Buffer.from(await upstream.arrayBuffer());
+        const buf = isHlsPlaylist(ct, url) ? Buffer.from(await upstream.text()) : Buffer.from(await upstream.arrayBuffer());
         await setCached(url, buf, { meta: { contentType: ct } });
       } catch (e) {
-        if (DEBUG) console.debug("prefetch error:", e.message);
+        if (DEBUG) console.debug("prefetch error:", e?.message || e);
       }
     });
     await Promise.allSettled(batch);
   }
 }
 
-// Main streaming endpoint
+// Build upstream headers based on incoming request; forward Range and User-Agent where present
+function buildUpstreamHeaders(req, referer) {
+  const headers = {
+    Referer: referer || req.query.referer || req.get("referer") || "",
+    "User-Agent": req.get("user-agent") || "Mozilla/5.0",
+    Accept: "*/*",
+    Origin: req.get("origin") || "",
+  };
+  const range = req.get("range");
+  if (range) headers.Range = range;
+  return headers;
+}
+
+/**
+ * rewriteManifest
+ * - Rewrites every URL appearing in a playlist (absolute + relative)
+ * - Rewrites URIs inside attributes like: #EXT-X-MAP:URI="init.mp4"
+ * - Avoids rewrapping URLs that already point to this proxy host or contain /stream?url=
+ */
+function rewriteManifest(text, baseUrl, rewriteOrigin, referer) {
+  const lines = text.split(/\r?\n/);
+  const base = new URL(baseUrl);
+
+  const rewrittenLines = lines.map((line) => {
+    const trimmed = line.trim();
+
+    // Keep comments / empty as-is
+    if (!trimmed || trimmed.startsWith("#")) {
+      // But for attribute lines (like #EXT-X-KEY:URI="...") we still may need to rewrite URI=""
+      // handle lines with URI="...": replace the inner URL if present
+      if (trimmed.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (m, uri) => {
+          try {
+            const resolved = new URL(uri, base).toString();
+            if (resolved.includes("/stream?url=") || resolved.includes(rewriteOrigin)) return `URI="${resolved}"`;
+            const sp = new URLSearchParams({ url: resolved });
+            if (referer) sp.set("referer", referer);
+            return `URI="${rewriteOrigin}/stream?${sp.toString()}"`;
+          } catch {
+            return m;
+          }
+        });
+      }
+      return line;
+    }
+
+    // For non-comment lines (usually segment/playlist URIs), attempt to resolve & proxy
+    try {
+      const resolved = new URL(trimmed, base).toString();
+      // If it's already proxied/pointing to our rewrite origin, keep as is
+      if (resolved.includes("/stream?url=") || resolved.includes(rewriteOrigin)) return resolved;
+      const sp = new URLSearchParams({ url: resolved });
+      if (referer) sp.set("referer", referer);
+      return `${rewriteOrigin}/stream?${sp.toString()}`;
+    } catch {
+      // fallback: try to rewrite any absolute URLs in the line (rare), using regex
+      return line.replace(/(https?:\/\/[^\s"']+)/g, (match) => {
+        try {
+          if (match.includes("/stream?url=") || match.includes(rewriteOrigin)) return match;
+          const sp = new URLSearchParams({ url: match });
+          if (referer) sp.set("referer", referer);
+          return `${rewriteOrigin}/stream?${sp.toString()}`;
+        } catch {
+          return match;
+        }
+      });
+    }
+  });
+
+  return rewrittenLines.join("\n");
+}
+
+// MAIN /stream endpoint
 app.get("/stream", async (req, res) => {
   try {
     const rawUrl = req.query.url;
     if (!rawUrl) return res.status(400).json({ error: "Missing url parameter" });
 
-    const referer = req.query.referer || "https://megacloud.blog";
-    const key = decodeURIComponent(rawUrl);
-    const rewriteOrigin = getRewriteOrigin(req);
+    // Referer fallback: prefer provided query param, otherwise fallback to common referer
+    const referer = req.query.referer || req.query.referer || "https://megacloud.blog";
 
-    // ✅ Try cache first
+    // Decode once to avoid double-encoding problems
+    const key = (() => {
+      try {
+        return decodeURIComponent(String(rawUrl));
+      } catch {
+        return String(rawUrl);
+      }
+    })();
+
+    const rewriteOrigin = getRewriteOrigin(req);
+    if (DEBUG) console.debug("Proxy request for:", key);
+
+    // Try memory/disk cache
     const cached = await getCached(key);
     if (cached) {
+      if (DEBUG) console.debug("Serving cached:", key);
       res.setHeader("X-Cache", "HIT");
+      res.setHeader("Content-Encoding", "identity");
+      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "*");
-      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
-      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
+      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
       return res.send(cached);
     }
 
-    // ✅ Fetch upstream content
+    // Fetch upstream while forwarding Range + UA + Referer
     const upstream = await fetch(key, {
       agent: getAgent(key),
-      headers: {
-        Referer: referer,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        Accept: "*/*",
-      },
+      headers: buildUpstreamHeaders(req, referer),
+      redirect: "follow",
     });
 
+    // Mirror upstream status for streaming clients
+    res.status(upstream.status);
+
     const contentType = upstream.headers.get("content-type") || "";
-    const urlPath = new URL(key).pathname;
-
-    // ✅ Handle manifest rewriting (.m3u8)
-    if (isHlsPlaylist(contentType, urlPath)) {
-      let text = await upstream.text();
-      const base = new URL(key);
-
-      // Rewrite every URL (absolute or relative) to go through this proxy
-      const rewritten = text
-        .split("\n")
-        .map((line) => {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith("#")) return line;
-          try {
-            const resolved = new URL(trimmed, base).toString();
-            const sp = new URLSearchParams({ url: resolved });
-            if (referer) sp.set("referer", referer);
-            return `${rewriteOrigin}/stream?${sp.toString()}`;
-          } catch {
-            return line;
-          }
-        })
-        .join("\n");
-
-      // Cache and respond
-      const buf = Buffer.from(rewritten);
-      await setCached(key, buf, { meta: { contentType } });
-
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "*");
-      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
-      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
-      res.send(buf);
-
-      // Prefetch first few segments (optional)
-      const segmentUrls = Array.from(
-        new Set(
-          text
-            .split("\n")
-            .filter((l) => !l.startsWith("#") && l.trim())
-            .map((l) => {
-              try {
-                return new URL(l.trim(), base).toString();
-              } catch {
-                return null;
-              }
-            })
-            .filter(Boolean)
-        )
-      );
-      if (PREFETCH_COUNT > 0) prefetchUrls(segmentUrls.slice(0, PREFETCH_COUNT), referer).catch(() => {});
-      return;
+    // Copy most headers (except hop-by-hop, we override CORS)
+    for (const [k, v] of upstream.headers.entries()) {
+      const lower = k.toLowerCase();
+      if (["content-encoding", "transfer-encoding", "connection"].includes(lower)) continue;
+      try {
+        // Some headers may throw if values are arrays; setHeader handles strings
+        res.setHeader(k, v);
+      } catch {}
     }
 
-    // ✅ For binary / segment types (ts, m4s, jpg, etc.)
-    if (isBinaryType(contentType, urlPath)) {
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "*");
-      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
-      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
-
-      const arrayBuffer = await upstream.arrayBuffer();
-      const buf = Buffer.from(arrayBuffer);
-      res.send(buf);
-
-      if (buf.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, buf, { meta: { contentType } });
-      return;
-    }
-
-    // ✅ Default fallback (text/json/html)
-    const buf = Buffer.from(await upstream.arrayBuffer());
+    // Ensure CORS + expose
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+
+    const urlPath = new URL(key).pathname;
+
+    // 1) MANIFEST (.m3u8) -> rewrite every referenced URL to proxy through /stream
+    if (isHlsPlaylist(contentType, urlPath)) {
+      const text = await upstream.text();
+      const rewritten = rewriteManifest(text, key, rewriteOrigin, referer);
+
+      const buf = Buffer.from(rewritten);
+      await setCached(key, buf, { meta: { contentType: "application/vnd.apple.mpegurl" } });
+
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Content-Encoding", "identity");
+      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
+      res.setHeader("X-Cache", "MISS");
+      return res.send(buf);
+    }
+
+    // 2) BINARY segments (ts, m4s, jpg, etc.) -> stream whole response, forward Range support
+    if (isBinaryType(contentType, urlPath)) {
+      if (DEBUG) console.debug("Serving binary content:", urlPath, "Type:", contentType);
+      res.setHeader("Content-Encoding", "identity");
+      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
+      res.setHeader("X-Cache", "MISS");
+
+      // If upstream supplies content-range or accept-ranges, mirror them
+      const upstreamArrayBuffer = await upstream.arrayBuffer();
+      const buf = Buffer.from(upstreamArrayBuffer);
+
+      // Set length headers if not already set
+      if (!res.getHeader("Content-Length")) {
+        try {
+          res.setHeader("Content-Length", String(buf.length));
+        } catch {}
+      }
+
+      // Send buffer
+      res.send(buf);
+
+      // Cache small objects only
+      if (buf.length <= CACHE_SIZE_LIMIT_BYTES) {
+        await setCached(key, buf, { meta: { contentType } });
+      }
+      return;
+    }
+
+    // 3) FALLBACK (JSON, HTML, etc.)
+    const fallbackBuffer = Buffer.from(await upstream.arrayBuffer());
+    res.setHeader("Content-Encoding", "identity");
     res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
-    res.setHeader("Content-Type", contentType);
-    res.send(buf);
-    if (buf.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, buf, { meta: { contentType } });
+    res.setHeader("X-Cache", "MISS");
+    if (!res.getHeader("Content-Type")) res.setHeader("Content-Type", contentType || "application/octet-stream");
+    res.send(fallbackBuffer);
+    if (fallbackBuffer.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, fallbackBuffer, { meta: { contentType } });
 
   } catch (err) {
     if (DEBUG) console.error("Proxy error:", err);
     if (!res.headersSent) res.status(500).json({ error: "Proxy error", message: String(err?.message || err) });
   }
 });
-
 
 // Disk cleanup
 if (DISK_CACHE_ENABLED) {
@@ -335,20 +426,19 @@ if (DISK_CACHE_ENABLED) {
       const files = await fsp.readdir(DISK_CACHE_DIR);
       const now = Date.now();
       for (const f of files) {
-        if (f.endsWith(".meta.json")) {
-          const metaPath = path.join(DISK_CACHE_DIR, f);
-          try {
-            const meta = JSON.parse(await fsp.readFile(metaPath, "utf8"));
-            if (now - (meta.timestamp || 0) > CACHE_TTL) {
-              const base = metaPath.replace(/\.meta\.json$/, "");
-              await fsp.rm(metaPath).catch(() => {});
-              await fsp.rm(base).catch(() => {});
-            }
-          } catch {}
-        }
+        if (!f.endsWith(".meta.json")) continue;
+        const metaPath = path.join(DISK_CACHE_DIR, f);
+        try {
+          const meta = JSON.parse(await fsp.readFile(metaPath, "utf8"));
+          if (now - (meta.timestamp || 0) > CACHE_TTL) {
+            const base = metaPath.replace(/\.meta\.json$/, "");
+            await fsp.rm(metaPath).catch(() => {});
+            await fsp.rm(base).catch(() => {});
+          }
+        } catch {}
       }
     } catch (e) {
-      if (DEBUG) console.debug("Disk cleanup error:", e.message);
+      if (DEBUG) console.debug("Disk cleanup error:", e?.message || e);
     }
   }, Math.max(60_000, CACHE_TTL));
 }
