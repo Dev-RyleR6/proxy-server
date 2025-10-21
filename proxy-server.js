@@ -211,50 +211,42 @@ app.get("/stream", async (req, res) => {
     if (!rawUrl) return res.status(400).json({ error: "Missing url parameter" });
 
     const referer = req.query.referer || "https://megacloud.blog";
-    const key = decodeURIComponent(rawUrl); // ✅ Fix double encoding
+    const key = decodeURIComponent(rawUrl);
+    const rewriteOrigin = getRewriteOrigin(req);
 
+    // ✅ Try cache first
     const cached = await getCached(key);
     if (cached) {
       res.setHeader("X-Cache", "HIT");
-      res.setHeader("Content-Encoding", "identity");
-      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "*");
       res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
+      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
       return res.send(cached);
     }
 
-    // ✅ Added consistent desktop headers
+    // ✅ Fetch upstream content
     const upstream = await fetch(key, {
       agent: getAgent(key),
       headers: {
         Referer: referer,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
         Accept: "*/*",
-        Origin: "https://megacloud.blog",
       },
     });
 
-    res.status(upstream.status);
     const contentType = upstream.headers.get("content-type") || "";
-    for (const [k, v] of upstream.headers.entries()) {
-      if (!["content-encoding", "transfer-encoding", "connection"].includes(k.toLowerCase())) res.setHeader(k, v);
-    }
-
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
-
     const urlPath = new URL(key).pathname;
-    const rewriteOrigin = getRewriteOrigin(req);
 
+    // ✅ Handle manifest rewriting (.m3u8)
     if (isHlsPlaylist(contentType, urlPath)) {
-      const text = await upstream.text();
+      let text = await upstream.text();
       const base = new URL(key);
-      const lines = text.split("\n");
-      const rewritten = lines
+
+      // Rewrite every URL (absolute or relative) to go through this proxy
+      const rewritten = text
+        .split("\n")
         .map((line) => {
           const trimmed = line.trim();
           if (!trimmed || trimmed.startsWith("#")) return line;
@@ -269,17 +261,24 @@ app.get("/stream", async (req, res) => {
         })
         .join("\n");
 
-      await setCached(key, Buffer.from(rewritten), { meta: { contentType: "application/vnd.apple.mpegurl" } });
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Content-Encoding", "identity");
-      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
-      res.setHeader("X-Cache", "MISS");
-      res.send(rewritten);
+      // Cache and respond
+      const buf = Buffer.from(rewritten);
+      await setCached(key, buf, { meta: { contentType } });
 
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "*");
+      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
+      res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
+      res.send(buf);
+
+      // Prefetch first few segments (optional)
       const segmentUrls = Array.from(
         new Set(
-          lines
-            .filter((l) => !l.startsWith("#"))
+          text
+            .split("\n")
+            .filter((l) => !l.startsWith("#") && l.trim())
             .map((l) => {
               try {
                 return new URL(l.trim(), base).toString();
@@ -290,66 +289,44 @@ app.get("/stream", async (req, res) => {
             .filter(Boolean)
         )
       );
-
       if (PREFETCH_COUNT > 0) prefetchUrls(segmentUrls.slice(0, PREFETCH_COUNT), referer).catch(() => {});
       return;
     }
 
-    // Binary/video streaming
+    // ✅ For binary / segment types (ts, m4s, jpg, etc.)
     if (isBinaryType(contentType, urlPath)) {
-      if (DEBUG) console.debug("Serving binary content:", urlPath, "Type:", contentType);
-      res.setHeader("Content-Encoding", "identity");
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "*");
+      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
       res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
-      res.setHeader("X-Cache", "MISS");
 
-      const body = upstream.body;
-      if (!body || typeof body.pipe !== "function") {
-        const buf = Buffer.from(await upstream.arrayBuffer());
-        res.send(buf);
-        if (buf.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, buf, { meta: { contentType } });
-        return;
-      }
+      const arrayBuffer = await upstream.arrayBuffer();
+      const buf = Buffer.from(arrayBuffer);
+      res.send(buf);
 
-      let buffers = [],
-        total = 0;
-      body.on("data", (chunk) => {
-        try {
-          res.write(chunk);
-        } catch {}
-        if (total <= CACHE_SIZE_LIMIT_BYTES) {
-          buffers.push(chunk);
-          total += chunk.length;
-        } else {
-          buffers = null;
-        }
-      });
-      body.on("end", async () => {
-        try {
-          res.end();
-        } catch {}
-        if (buffers && total > 0) await setCached(key, Buffer.concat(buffers, total), { meta: { contentType } });
-      });
-      body.on("error", (err) => {
-        if (DEBUG) console.debug("Upstream error:", err.message);
-        try {
-          res.end();
-        } catch {}
-      });
+      if (buf.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, buf, { meta: { contentType } });
       return;
     }
 
-    // Fallback
+    // ✅ Default fallback (text/json/html)
     const buf = Buffer.from(await upstream.arrayBuffer());
-    res.setHeader("Content-Encoding", "identity");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
     res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}`);
-    res.setHeader("X-Cache", "MISS");
+    res.setHeader("Content-Type", contentType);
     res.send(buf);
     if (buf.length <= CACHE_SIZE_LIMIT_BYTES) await setCached(key, buf, { meta: { contentType } });
+
   } catch (err) {
     if (DEBUG) console.error("Proxy error:", err);
     if (!res.headersSent) res.status(500).json({ error: "Proxy error", message: String(err?.message || err) });
   }
 });
+
 
 // Disk cleanup
 if (DISK_CACHE_ENABLED) {
