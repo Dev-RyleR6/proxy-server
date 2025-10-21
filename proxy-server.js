@@ -134,18 +134,30 @@ const isBinaryType = (ct, urlPath) => {
 // Express setup
 const app = express();
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.length === 0) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      if (DEBUG) console.warn("CORS blocked:", origin);
-      cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin(origin, cb) {
+    // Always allow requests with no Origin (curl, server-to-server, etc.)
+    if (!origin) return cb(null, true);
+
+    // ✅ Always allow self-origin (Railway, Vercel, localhost, etc.)
+    const host = process.env.PUBLIC_HOST || "proxy-server-production-fb60.up.railway.app";
+    if (origin.includes(host) || origin.includes("localhost") || origin.includes("127.0.0.1")) {
+      return cb(null, true);
+    }
+
+    // ✅ Allow all if no specific list defined
+    if (allowedOrigins.length === 0) return cb(null, true);
+
+    // ✅ Check if origin matches allowed list
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+
+    // ❌ Block anything else
+    if (DEBUG) console.warn("🚫 CORS blocked:", origin);
+    cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+}));
+
 
 app.use(compression({ filter: (req, res) => /json|text|javascript|css|html/.test(res.getHeader("Content-Type") || "") }));
 app.use(DEBUG ? morgan("dev") : morgan("tiny"));
