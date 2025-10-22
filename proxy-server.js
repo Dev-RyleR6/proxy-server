@@ -1,16 +1,5 @@
-// proxy-server.js
-/**
- * Production-ready HLS proxy server
- * - Rewrites all .m3u8 manifests (master + variants) so every referenced URL
- *   (segments, thumbnails, nested manifests, maps) is routed through this proxy.
- * - Streams binary segments and forwards Range headers to support seeking.
- * - Caches small resources in memory + disk (LRU + disk cache).
- * - Adds permissive CORS headers so browsers (mobile & desktop) can fetch segments.
- *
- * Notes:
- * - Configure PUBLIC_HOST in .env to match your deployed host if running behind proxies.
- * - You may adjust CACHE_TTL, PREFETCH_COUNT and CACHE_SIZE_LIMIT_BYTES to suit your environment.
- */
+// proxy-server.js (revised)
+// Production-ready HLS proxy with improved CORS, SSRF protections, timeouts, and streaming error handling.
 
 import express from "express";
 import fetch from "node-fetch";
@@ -25,6 +14,7 @@ import path from "path";
 import crypto from "crypto";
 import http from "http";
 import https from "https";
+import net from "net";
 
 dotenv.config();
 
@@ -36,6 +26,7 @@ const DISK_CACHE_ENABLED = (process.env.DISK_CACHE_ENABLED || "true") === "true"
 const DISK_CACHE_DIR = process.env.DISK_CACHE_DIR || "/tmp/proxy-cache";
 const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT || "3", 10);
 const CACHE_SIZE_LIMIT_BYTES = parseInt(process.env.CACHE_SIZE_LIMIT_BYTES || String(8 * 1024 * 1024), 10); // 8 MB default
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "15000", 10); // 15s default
 
 // Allowed origins (optional whitelist)
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -66,7 +57,7 @@ const diskPathForKey = (key) => path.join(DISK_CACHE_DIR, hashKey(key));
 // In-memory cache
 const memoryCache = new LRUCache({ max: MEMORY_CACHE_MAX, ttl: CACHE_TTL });
 
-// Disk cache helpers
+// Disk cache helpers (unchanged)
 async function readFromDisk(key) {
   if (!DISK_CACHE_ENABLED) return null;
   const file = diskPathForKey(key);
@@ -130,7 +121,7 @@ async function setCached(key, buffer, options = {}) {
   }
 }
 
-// Content helpers
+// Content helpers (unchanged)
 const isHlsPlaylist = (ct, urlPath) => {
   const type = (ct || "").toLowerCase();
   return (
@@ -154,37 +145,72 @@ const isBinaryType = (ct, urlPath) => {
 // Express setup
 const app = express();
 
-// CORS policy: allow no-origin (curl), allow self-origin, optionally whitelist
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      try {
-        if (origin.includes(PUBLIC_HOST) || origin.includes("localhost") || origin.includes("127.0.0.1")) {
-          return cb(null, true);
-        }
-      } catch (e) {}
-      if (allowedOrigins.length === 0) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
+// Helper: check for IP literal and private/reserved ranges
+function isPrivateIpLiteral(hostname) {
+  // If hostname is an IP literal, check if it's private/reserved
+  if (net.isIP(hostname) === 0) return false;
+  // IPv4 checks
+  if (hostname.includes(".")) {
+    const parts = hostname.split(".").map(Number);
+    if (parts[0] === 10) return true; // 10.0.0.0/8
+    if (parts[0] === 127) return true; // loopback
+    if (parts[0] === 169 && parts[1] === 254) return true; // link-local
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
+    if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16
+    if (parts[0] >= 224) return true; // multicast & reserved
+  }
+  // IPv6 basic check for loopback / link-local (this is conservative)
+  if (hostname.startsWith("::1") || hostname.startsWith("fe80") || hostname.startsWith("fc") || hostname.startsWith("fd")) {
+    return true;
+  }
+  return false;
+}
+
+// CORS: echo origin when present (to allow credentials), otherwise allow curl/no-origin
+app.use((req, res, next) => {
+  const origin = req.get("origin");
+  if (!origin) {
+    // no origin (curl / server-to-server) -> allow
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else {
+    // If whitelist present, enforce it
+    if (allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
       if (DEBUG) console.warn("CORS blocked:", origin);
-      cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
+      res.setHeader("Access-Control-Allow-Origin", "null");
+    } else {
+      // echo the request origin so credentials can be used
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+  }
+  next();
+});
 
 app.use(
   compression({
-    filter: (req, res) => /json|text|javascript|css|html/.test(res.getHeader("Content-Type") || ""),
+    filter: (req, res) => {
+      // compress text-like responses (same intention as before)
+      const ct = res.getHeader("Content-Type") || "";
+      return /json|text|javascript|css|html/.test(String(ct));
+    },
   })
 );
+
 app.use(DEBUG ? morgan("dev") : morgan("tiny"));
 
 app.get("/health", (_, res) => res.json({ status: "OK", message: "Proxy running" }));
 
-// OPTIONS handler for preflight
-app.options("/stream", (_, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+// OPTIONS handler for preflight: echo origin when present
+app.options("/stream", (req, res) => {
+  const origin = req.get("origin");
+  if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
@@ -197,7 +223,7 @@ const getRewriteOrigin = (req) => {
   return `${proto}://${host}`;
 };
 
-// Prefetch utility
+// Prefetch utility (unchanged but uses getAgent)
 async function prefetchUrls(urls, referer) {
   const concurrency = 6;
   for (let i = 0; i < urls.length; i += concurrency) {
@@ -239,10 +265,7 @@ function buildUpstreamHeaders(req, referer) {
 }
 
 /**
- * rewriteManifest
- * - Rewrites every URL appearing in a playlist (absolute + relative)
- * - Rewrites URIs inside attributes like: #EXT-X-MAP:URI="init.mp4"
- * - Avoids rewrapping URLs that already point to this proxy host or contain /stream?url=
+ * rewriteManifest (unchanged logic, minor robustness)
  */
 function rewriteManifest(text, baseUrl, rewriteOrigin, referer) {
   const lines = text.split(/\r?\n/);
@@ -253,7 +276,6 @@ function rewriteManifest(text, baseUrl, rewriteOrigin, referer) {
 
     // Keep comments / empty as-is
     if (!trimmed || trimmed.startsWith("#")) {
-      // But for attribute lines (like #EXT-X-KEY:URI="...") we still may need to rewrite URI=""
       // handle lines with URI="...": replace the inner URL if present
       if (trimmed.includes('URI="')) {
         return line.replace(/URI="([^"]+)"/g, (m, uri) => {
@@ -303,8 +325,8 @@ app.get("/stream", async (req, res) => {
     const rawUrl = req.query.url;
     if (!rawUrl) return res.status(400).json({ error: "Missing url parameter" });
 
-    // Referer fallback: prefer provided query param, otherwise fallback to common referer
-    const referer = req.query.referer || req.query.referer || "https://megacloud.blog";
+    // Referer fallback
+    const referer = req.query.referer || "https://megacloud.blog";
 
     // Decode once to avoid double-encoding problems
     const key = (() => {
@@ -314,6 +336,24 @@ app.get("/stream", async (req, res) => {
         return String(rawUrl);
       }
     })();
+
+    // Validate scheme
+    let parsed;
+    try {
+      parsed = new URL(key);
+    } catch {
+      return res.status(400).json({ error: "Invalid url parameter" });
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return res.status(400).json({ error: "Only http/https URLs are allowed" });
+    }
+
+    // Prevent basic SSRF: block ip-literal private ranges and localhost
+    const hostname = parsed.hostname;
+    if (hostname === "localhost" || isPrivateIpLiteral(hostname)) {
+      if (DEBUG) console.warn("Blocked private/loopback host:", hostname);
+      return res.status(403).json({ error: "Blocked host" });
+    }
 
     const rewriteOrigin = getRewriteOrigin(req);
     if (DEBUG) console.debug("Proxy request for:", key);
@@ -325,7 +365,7 @@ app.get("/stream", async (req, res) => {
       res.setHeader("X-Cache", "HIT");
       res.setHeader("Content-Encoding", "identity");
       res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
-      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Origin", req.get("origin") || "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "*");
       res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
@@ -333,11 +373,26 @@ app.get("/stream", async (req, res) => {
     }
 
     // Fetch upstream while forwarding Range + UA + Referer
-    const upstream = await fetch(key, {
-      agent: getAgent(key),
-      headers: buildUpstreamHeaders(req, referer),
-      redirect: "follow",
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+
+    let upstream;
+    try {
+      upstream = await fetch(key, {
+        agent: getAgent(key),
+        headers: buildUpstreamHeaders(req, referer),
+        redirect: "follow",
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timeout);
+      if (err.name === "AbortError") {
+        return res.status(504).json({ error: "Upstream timeout" });
+      }
+      if (DEBUG) console.error("Fetch error:", err);
+      return res.status(502).json({ error: "Upstream fetch failed", message: String(err?.message || err) });
+    }
+    clearTimeout(timeout);
 
     // Mirror upstream status for streaming clients
     res.status(upstream.status);
@@ -348,18 +403,24 @@ app.get("/stream", async (req, res) => {
       const lower = k.toLowerCase();
       if (["content-encoding", "transfer-encoding", "connection"].includes(lower)) continue;
       try {
-        // Some headers may throw if values are arrays; setHeader handles strings
         res.setHeader(k, v);
       } catch {}
     }
 
     // Ensure CORS + expose
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    const origin = req.get("origin");
+    if (origin && (allowedOrigins.length === 0 || allowedOrigins.includes(origin))) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    } else {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
     res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
 
-    const urlPath = new URL(key).pathname;
+    const urlPath = parsed.pathname;
 
     // 1) MANIFEST (.m3u8) -> rewrite every referenced URL to proxy through /stream
     if (isHlsPlaylist(contentType, urlPath)) {
@@ -376,30 +437,55 @@ app.get("/stream", async (req, res) => {
       return res.send(buf);
     }
 
-    // 2) BINARY segments (ts, m4s, jpg, etc.) -> stream whole response, forward Range support
+    // 2) BINARY segments (ts, m4s, jpg, etc.) -> stream directly, support Range requests
     if (isBinaryType(contentType, urlPath)) {
-      if (DEBUG) console.debug("Serving binary content:", urlPath, "Type:", contentType);
+      if (DEBUG) console.debug("Streaming binary content:", urlPath, "Type:", contentType);
+
       res.setHeader("Content-Encoding", "identity");
       res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL / 1000)}, immutable`);
       res.setHeader("X-Cache", "MISS");
 
-      // If upstream supplies content-range or accept-ranges, mirror them
-      const upstreamArrayBuffer = await upstream.arrayBuffer();
-      const buf = Buffer.from(upstreamArrayBuffer);
+      // Forward range headers correctly for seeking
+      const range = req.get("range");
+      if (range) res.setHeader("Accept-Ranges", "bytes");
 
-      // Set length headers if not already set
-      if (!res.getHeader("Content-Length")) {
-        try {
-          res.setHeader("Content-Length", String(buf.length));
-        } catch {}
-      }
+      // Stream directly to client
+      if (upstream.body) {
+        const chunks = [];
+        let total = 0;
+        let caching = true;
 
-      // Send buffer
-      res.send(buf);
+        upstream.body.on("data", (chunk) => {
+          try {
+            total += chunk.length;
+            if (total <= CACHE_SIZE_LIMIT_BYTES) chunks.push(chunk);
+            else caching = false;
+          } catch {}
+        });
 
-      // Cache small objects only
-      if (buf.length <= CACHE_SIZE_LIMIT_BYTES) {
-        await setCached(key, buf, { meta: { contentType } });
+        upstream.body.on("error", (err) => {
+          if (DEBUG) console.error("Upstream stream error:", err);
+          try { res.destroy(err); } catch {}
+        });
+
+        upstream.body.on("end", async () => {
+          if (caching && chunks.length) {
+            const buf = Buffer.concat(chunks);
+            try {
+              await setCached(key, buf, { meta: { contentType } });
+            } catch (e) {
+              if (DEBUG) console.debug("Cache store error:", e?.message || e);
+            }
+          }
+        });
+
+        // Pipe will handle backpressure; ensure errors are propagated
+        upstream.body.pipe(res).on("error", (err) => {
+          if (DEBUG) console.error("Pipe error:", err);
+          try { res.destroy(err); } catch {}
+        });
+      } else {
+        res.status(502).json({ error: "Upstream has no body to stream" });
       }
       return;
     }
@@ -419,7 +505,7 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// Disk cleanup
+// Disk cleanup (unchanged)
 if (DISK_CACHE_ENABLED) {
   setInterval(async () => {
     try {
